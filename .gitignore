@@ -1,0 +1,12 @@
+# Build artifacts
+packet_analyzer
+*.o
+*.out
+
+# Editor/IDE
+.vscode/
+.idea/
+*.swp
+
+# OS
+.DS_Store
