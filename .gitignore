@@ -10,3 +10,4 @@ packet_analyzer
 
 # OS
 .DS_Store
+*.pcap
