@@ -127,7 +127,7 @@ network-packet-analyzer/
 ## Relevance
 
 This project demonstrates several fundamentals commonly required for
-Linux/embedded/networking software roles (e.g. Qualcomm SWE positions):
+Linux/embedded/networking software roles (SWE positions):
 
 - **C/C++ on Linux** — no external parsing libraries; headers are decoded
   by hand over raw memory.
