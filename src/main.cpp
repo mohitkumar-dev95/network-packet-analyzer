@@ -4,11 +4,12 @@
 // structured memory mapping over the raw bytes.
 //
 // Build:  make
-// Run:    sudo ./packet_analyzer [interface]
+// Run:    sudo ./packet_analyzer [-i interface] [-f "bpf filter"] [-w out.pcap]
 //
 // Requires: libpcap-dev (Linux), root privileges for live capture.
 
 #include <pcap.h>
+#include <csignal>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -16,6 +17,7 @@
 #include <string>
 #include <netinet/in.h>
 #include <arpa/inet.h>
+#include <unistd.h>   // getopt
 
 // ---------------------------------------------------------------------------
 // Protocol header layouts, mapped directly onto the raw packet bytes.
@@ -65,6 +67,36 @@ static const int ETHERNET_HEADER_LEN = sizeof(EthernetHeader);
 static const uint16_t ETHERTYPE_IPV4 = 0x0800;
 
 // ---------------------------------------------------------------------------
+// Capture-wide state: running counters plus an optional .pcap dump file.
+// Passed through pcap_loop's user-data pointer so the handler can update it
+// without relying on global mutable state.
+// ---------------------------------------------------------------------------
+
+struct CaptureStats {
+    long total    = 0;
+    long tcp      = 0;
+    long udp      = 0;
+    long other_ip = 0;
+    long non_ip   = 0;
+};
+
+struct CaptureContext {
+    CaptureStats  stats;
+    pcap_dumper_t *dumper = nullptr; // non-null if -w was passed
+};
+
+// Global handle so the SIGINT handler can request pcap_loop to stop cleanly.
+// pcap_breakloop() is async-signal-safe per the libpcap docs, unlike calling
+// pcap_close() directly from a signal handler.
+static pcap_t *g_handle = nullptr;
+
+static void handle_sigint(int /*signum*/) {
+    if (g_handle != nullptr) {
+        pcap_breakloop(g_handle);
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
 
@@ -73,17 +105,32 @@ static void print_mac(const uint8_t *mac) {
            mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
 }
 
+static void print_usage(const char *prog) {
+    fprintf(stderr,
+        "Usage: sudo %s [-i interface] [-f \"bpf filter\"] [-w output.pcap] [-h]\n"
+        "  -i  Network interface to capture on (default: first available)\n"
+        "  -f  BPF filter expression, e.g. \"tcp port 443\" or \"udp\"\n"
+        "  -w  Write captured packets to a .pcap file (Wireshark-compatible)\n"
+        "  -h  Show this help\n",
+        prog);
+}
+
 // ---------------------------------------------------------------------------
 // Per-packet callback invoked by pcap_loop for every captured frame.
 // ---------------------------------------------------------------------------
 
 static void packet_handler(u_char *user_args, const struct pcap_pkthdr *header,
                             const u_char *packet) {
-    (void)user_args;
-    static long packet_count = 0;
-    packet_count++;
+    CaptureContext *ctx = reinterpret_cast<CaptureContext *>(user_args);
+    ctx->stats.total++;
 
-    printf("\n================= Packet #%ld =================\n", packet_count);
+    // If requested, also write the raw packet out to a .pcap file so it can
+    // be opened later in Wireshark or re-analyzed with other tools.
+    if (ctx->dumper != nullptr) {
+        pcap_dump(reinterpret_cast<u_char *>(ctx->dumper), header, packet);
+    }
+
+    printf("\n================= Packet #%ld =================\n", ctx->stats.total);
 
     time_t ts = header->ts.tv_sec;
     char time_buf[32];
@@ -109,6 +156,7 @@ static void packet_handler(u_char *user_args, const struct pcap_pkthdr *header,
 
     if (ether_type != ETHERTYPE_IPV4) {
         printf("  [-] Non-IPv4 EtherType, skipping L3/L4 parsing.\n");
+        ctx->stats.non_ip++;
         return;
     }
 
@@ -150,6 +198,7 @@ static void packet_handler(u_char *user_args, const struct pcap_pkthdr *header,
 
     switch (ip->protocol) {
         case IPPROTO_TCP: {
+            ctx->stats.tcp++;
             if (remaining < sizeof(TCPHeader)) {
                 printf("  [!] Frame too short for a TCP header.\n");
                 return;
@@ -161,6 +210,7 @@ static void packet_handler(u_char *user_args, const struct pcap_pkthdr *header,
             break;
         }
         case IPPROTO_UDP: {
+            ctx->stats.udp++;
             if (remaining < sizeof(UDPHeader)) {
                 printf("  [!] Frame too short for a UDP header.\n");
                 return;
@@ -171,23 +221,50 @@ static void packet_handler(u_char *user_args, const struct pcap_pkthdr *header,
             break;
         }
         default:
+            ctx->stats.other_ip++;
             printf("Transport| Protocol %d (not TCP/UDP), skipping port parsing.\n",
                    ip->protocol);
     }
 }
 
+static void print_summary(const CaptureStats &s) {
+    printf("\n================= Capture Summary =================\n");
+    printf("Total packets : %ld\n", s.total);
+    printf("  TCP         : %ld\n", s.tcp);
+    printf("  UDP         : %ld\n", s.udp);
+    printf("  Other IPv4  : %ld\n", s.other_ip);
+    printf("  Non-IPv4    : %ld\n", s.non_ip);
+}
+
 // ---------------------------------------------------------------------------
-// Entry point: selects an interface, opens it in promiscuous mode, and
-// hands every captured frame to packet_handler.
+// Entry point: parses options, opens the interface in promiscuous mode,
+// optionally applies a BPF filter and/or a .pcap dump file, then hands every
+// captured frame to packet_handler until Ctrl+C.
 // ---------------------------------------------------------------------------
 
 int main(int argc, char *argv[]) {
     char errbuf[PCAP_ERRBUF_SIZE];
+    std::string iface_arg;
+    std::string filter_expr;
+    std::string dump_path;
+
+    int opt;
+    while ((opt = getopt(argc, argv, "i:f:w:h")) != -1) {
+        switch (opt) {
+            case 'i': iface_arg  = optarg; break;
+            case 'f': filter_expr = optarg; break;
+            case 'w': dump_path  = optarg; break;
+            case 'h': print_usage(argv[0]); return EXIT_SUCCESS;
+            default:  print_usage(argv[0]); return EXIT_FAILURE;
+        }
+    }
+
     std::string dev_storage;
     const char *dev = nullptr;
 
-    if (argc == 2) {
-        dev = argv[1];
+    if (!iface_arg.empty()) {
+        dev_storage = iface_arg;
+        dev = dev_storage.c_str();
     } else {
         pcap_if_t *alldevs;
         if (pcap_findalldevs(&alldevs, errbuf) == -1) {
@@ -200,7 +277,7 @@ int main(int argc, char *argv[]) {
         }
         dev_storage = alldevs->name;
         dev = dev_storage.c_str();
-        printf("No interface given, defaulting to: %s\n", dev);
+        printf("No interface given (-i), defaulting to: %s\n", dev);
         pcap_freealldevs(alldevs);
     }
 
@@ -212,16 +289,54 @@ int main(int argc, char *argv[]) {
         return EXIT_FAILURE;
     }
 
-    // Only capture Ethernet + IPv4 links for this analyzer.
     if (pcap_datalink(handle) != DLT_EN10MB) {
         fprintf(stderr, "Device %s does not provide Ethernet headers.\n", dev);
         pcap_close(handle);
         return EXIT_FAILURE;
     }
 
-    printf("Listening on %s. Press Ctrl+C to stop.\n", dev);
-    pcap_loop(handle, /*count=*/0, packet_handler, nullptr);
+    // ---- Optional BPF filter ----
+    if (!filter_expr.empty()) {
+        struct bpf_program fp;
+        if (pcap_compile(handle, &fp, filter_expr.c_str(), /*optimize=*/1, PCAP_NETMASK_UNKNOWN) == -1) {
+            fprintf(stderr, "Failed to compile filter '%s': %s\n", filter_expr.c_str(), pcap_geterr(handle));
+            pcap_close(handle);
+            return EXIT_FAILURE;
+        }
+        if (pcap_setfilter(handle, &fp) == -1) {
+            fprintf(stderr, "Failed to apply filter: %s\n", pcap_geterr(handle));
+            pcap_freecode(&fp);
+            pcap_close(handle);
+            return EXIT_FAILURE;
+        }
+        pcap_freecode(&fp);
+        printf("Applied BPF filter: \"%s\"\n", filter_expr.c_str());
+    }
 
+    // ---- Optional .pcap output file ----
+    CaptureContext ctx;
+    if (!dump_path.empty()) {
+        ctx.dumper = pcap_dump_open(handle, dump_path.c_str());
+        if (ctx.dumper == nullptr) {
+            fprintf(stderr, "Failed to open dump file %s: %s\n", dump_path.c_str(), pcap_geterr(handle));
+            pcap_close(handle);
+            return EXIT_FAILURE;
+        }
+        printf("Writing captured packets to: %s\n", dump_path.c_str());
+    }
+
+    // ---- Install Ctrl+C handler for a clean stop + summary ----
+    g_handle = handle;
+    std::signal(SIGINT, handle_sigint);
+
+    printf("Listening on %s. Press Ctrl+C to stop.\n", dev);
+    pcap_loop(handle, /*count=*/0, packet_handler, reinterpret_cast<u_char *>(&ctx));
+
+    print_summary(ctx.stats);
+
+    if (ctx.dumper != nullptr) {
+        pcap_dump_close(ctx.dumper);
+    }
     pcap_close(handle);
     return EXIT_SUCCESS;
 }

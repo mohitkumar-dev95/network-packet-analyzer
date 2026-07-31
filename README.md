@@ -42,17 +42,23 @@ Live packet capture requires raw socket access, so run as root (or grant
 the binary `CAP_NET_RAW`/`CAP_NET_ADMIN`):
 
 ```bash
-sudo ./packet_analyzer            # capture on the default interface
-sudo ./packet_analyzer eth0       # capture on a specific interface
+sudo ./packet_analyzer                              # capture on the default interface
+sudo ./packet_analyzer -i eth0                       # capture on a specific interface
+sudo ./packet_analyzer -i eth0 -f "tcp port 443"      # apply a BPF filter
+sudo ./packet_analyzer -w capture.pcap                # also save to a .pcap file (Wireshark-compatible)
+sudo ./packet_analyzer -i wlan0 -f "udp" -w udp.pcap  # combine interface + filter + dump
 ```
 
-Or via the Makefile:
+| Flag | Description |
+|------|-------------|
+| `-i <iface>` | Interface to capture on (default: first available) |
+| `-f "<expr>"` | BPF filter expression, e.g. `"tcp port 443"`, `"udp"`, `"host 8.8.8.8"` |
+| `-w <file>` | Write captured packets to a `.pcap` file you can open in Wireshark |
+| `-h` | Show usage |
 
-```bash
-make run
-```
-
-Stop capture with `Ctrl+C`.
+Stop capture with `Ctrl+C` — this triggers a clean shutdown via
+`pcap_breakloop()` and prints a summary of total packets captured, broken
+down by TCP / UDP / other IPv4 / non-IPv4.
 
 ## Example Output
 
@@ -62,6 +68,15 @@ Time: 2026-07-31 06:20:11.482113 | Captured: 74 bytes | On-wire: 74 bytes
 Ethernet | Src: aa:bb:cc:dd:ee:ff -> Dst: 11:22:33:44:55:66 | EtherType: 0x0800
 IPv4     | 192.168.1.10 -> 142.250.72.14 | IHL: 20 bytes | TTL: 64 | Total Len: 60 | Proto: 6
 TCP      | Port 51422 -> 443 | Seq: 123456789 | Ack: 0 | Flags: 0x02
+```
+
+```
+================= Capture Summary =================
+Total packets : 1
+  TCP         : 1
+  UDP         : 0
+  Other IPv4  : 0
+  Non-IPv4    : 0
 ```
 
 ## How It Works
@@ -80,6 +95,15 @@ TCP      | Port 51422 -> 443 | Seq: 123456789 | Ack: 0 | Flags: 0x02
 5. All multi-byte header fields are converted from network byte order
    (big-endian) to host byte order with `ntohs()` (16-bit) and `ntohl()`
    (32-bit) before being printed.
+6. An optional BPF filter (`-f`) is compiled with `pcap_compile()` and
+   applied with `pcap_setfilter()` so the kernel does the filtering before
+   packets even reach userspace.
+7. An optional `.pcap` dump file (`-w`) is written alongside the console
+   output using `pcap_dump()`, so captured traffic can be reopened later in
+   Wireshark or any other pcap-compatible tool.
+8. A `SIGINT` handler calls `pcap_breakloop()` on `Ctrl+C` for a clean stop
+   (rather than being killed mid-packet), then prints a per-protocol
+   summary before exiting.
 
 ## Project Structure
 
@@ -99,6 +123,22 @@ network-packet-analyzer/
 - Manual protocol header parsing without external parsing libraries
 - Byte-order (endianness) handling
 - Socket-level data flow
+
+## Relevance
+
+This project demonstrates several fundamentals commonly required for
+Linux/embedded/networking software roles (e.g. Qualcomm SWE positions):
+
+- **C/C++ on Linux** — no external parsing libraries; headers are decoded
+  by hand over raw memory.
+- **Protocols** — Ethernet, IPv4, TCP, UDP parsed directly from the wire
+  format, including correct network-to-host byte-order conversion
+  (`ntohs()` / `ntohl()`).
+- **OS/socket-level concepts** — promiscuous-mode capture, OSI layer
+  mapping, structured memory mapping over raw buffers.
+
+Note: this operates entirely in **userspace** via `libpcap` — it is not a
+kernel driver or firmware component.
 
 ## License
 
